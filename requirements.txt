@@ -1,0 +1,5 @@
+Flask==0.12
+uwsgi==2.0.15
+stagger==1.0.0
+python-librtmp==0.3.0
+

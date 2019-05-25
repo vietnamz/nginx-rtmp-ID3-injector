@@ -1,0 +1,347 @@
+diff --git a/nginx-rtmp-module/hls/ngx_rtmp_hls_module.c b/nginx-rtmp-module/hls/ngx_rtmp_hls_module.c
+index 9f6779c..fa9add1 100755
+--- a/nginx-rtmp-module/hls/ngx_rtmp_hls_module.c
++++ b/nginx-rtmp-module/hls/ngx_rtmp_hls_module.c
+@@ -79,6 +79,9 @@ typedef struct {
+     uint64_t                            aframe_pts;
+ 
+     ngx_rtmp_hls_variant_t             *var;
++    unsigned                            id3v2tag_running;
++    ngx_buf_t                          *id3v2_frame;
++    uint64_t                            meta_cc;
+ } ngx_rtmp_hls_ctx_t;
+ 
+ 
+@@ -342,6 +345,8 @@ ngx_module_t  ngx_rtmp_hls_module = {
+     NGX_MODULE_V1_PADDING
+ };
+ 
++static ngx_rtmp_hls_ctx_t* publishing_stream_ctx = NULL;
++static ngx_rtmp_session_t* publishing_stream_session = NULL;
+ 
+ static ngx_rtmp_hls_frag_t *
+ ngx_rtmp_hls_get_frag(ngx_rtmp_session_t *s, ngx_int_t n)
+@@ -944,12 +949,15 @@ ngx_rtmp_hls_open_fragment(ngx_rtmp_session_t *s, uint64_t ts,
+     }
+ 
+     if (ngx_rtmp_mpegts_open_file(&ctx->file, ctx->stream.data,
+-                                  s->connection->log)
++                                  s->connection->log, ctx->id3v2tag_running)
+         != NGX_OK)
+     {
+         return NGX_ERROR;
+     }
+ 
++    if (ctx->id3v2tag_running == 1)
++      ctx->id3v2tag_running = 2;
++
+     ctx->opened = 1;
+ 
+     f = ngx_rtmp_hls_get_frag(s, ctx->nfrags);
+@@ -1301,6 +1309,8 @@ ngx_rtmp_hls_publish(ngx_rtmp_session_t *s, ngx_rtmp_publish_t *v)
+ 
+         ctx = ngx_pcalloc(s->connection->pool, sizeof(ngx_rtmp_hls_ctx_t));
+         ngx_rtmp_set_ctx(s, ctx, ngx_rtmp_hls_module);
++        publishing_stream_ctx = ctx; // Hack for now.
++        publishing_stream_session = s; // Hack for now.
+ 
+     } else {
+ 
+@@ -1661,6 +1671,24 @@ ngx_rtmp_hls_flush_audio(ngx_rtmp_session_t *s)
+     ngx_log_debug1(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                    "hls: flush audio pts=%uL", frame.pts);
+ 
++    if ( ctx->id3v2tag_running == 2 )
++    {
++        ngx_rtmp_mpegts_frame_t   id3v2_frame;
++        ngx_memzero(&id3v2_frame, sizeof(id3v2_frame));
++        id3v2_frame.dts = frame.pts;
++        id3v2_frame.pts = id3v2_frame.dts;
++        id3v2_frame.cc = ctx->meta_cc;
++        id3v2_frame.pid = 0x102;
++        id3v2_frame.sid = 0xbd;
++        ngx_log_debug3(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++                       "[Tammd] hls: flush audio pts=%uL cc = %d sid = %d", id3v2_frame.pts, id3v2_frame.cc, id3v2_frame.sid);
++        ngx_rtmp_mpegts_write_frame(&ctx->file, &id3v2_frame, ctx->id3v2_frame);
++        ngx_pfree(s->connection->pool, ctx->id3v2_frame); //FIXME
++        ctx->id3v2_frame = NULL;
++        ctx->meta_cc = id3v2_frame.cc ;
++        ctx->id3v2tag_running = 0;
++    }
++
+     rc = ngx_rtmp_mpegts_write_frame(&ctx->file, &frame, b);
+ 
+     if (rc != NGX_OK) {
+@@ -2035,6 +2063,25 @@ ngx_rtmp_hls_video(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+     ngx_log_debug2(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
+                    "hls: video pts=%uL, dts=%uL", frame.pts, frame.dts);
+ 
++    if ( ctx->id3v2tag_running == 2)
++    {
++        ngx_rtmp_mpegts_frame_t   id3v2_frame;
++        ngx_memzero(&id3v2_frame, sizeof(id3v2_frame));
++        id3v2_frame.dts = frame.pts;
++        id3v2_frame.pts = id3v2_frame.dts;
++        id3v2_frame.cc = ctx->meta_cc;
++        id3v2_frame.pid = 0x102;
++        id3v2_frame.sid = 0xbd ;
++        ngx_log_debug3(NGX_LOG_DEBUG_RTMP, s->connection->log, 0,
++                       "[Tammd] hls: video flush pts=%uL cc = %d, sid = %d", id3v2_frame.pts, id3v2_frame.cc, id3v2_frame.sid);
++        ngx_rtmp_mpegts_write_frame(&ctx->file, &id3v2_frame, ctx->id3v2_frame);
++        ngx_pfree(s->connection->pool, ctx->id3v2_frame); //FIXME
++        ctx->id3v2_frame = NULL;
++        ctx->meta_cc = id3v2_frame.cc ;
++        ctx->id3v2tag_running = 0;
++
++    }
++
+     if (ngx_rtmp_mpegts_write_frame(&ctx->file, &frame, &out) != NGX_OK) {
+         ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                       "hls: video frame failed");
+@@ -2427,12 +2474,58 @@ ngx_rtmp_hls_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
+     return NGX_CONF_OK;
+ }
+ 
++static ngx_int_t
++ngx_rtmp_hls_id3v2 (ngx_rtmp_session_t* s, ngx_rtmp_header_t* h,
++                         ngx_chain_t* in )
++{
++    ngx_rtmp_hls_app_conf_t        *hacf;
++    ngx_rtmp_hls_ctx_t             *ctx;
++    hacf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_hls_module);
++    if (hacf == NULL) {
++       ngx_log_debug0( NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "[Tammd] hacf is NULL");
++       return NGX_OK;
++    }
++    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_hls_module); 
++    if (ctx == NULL || !ctx->opened) {
++        ngx_log_debug0( NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "[Tammd] 1 ctx is NULL");
++    }
++    ctx = publishing_stream_ctx;
++
++    if (ctx == NULL || !ctx->opened) {
++        ngx_log_debug0( NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "[Tammd] 2 ctx is NULL");
++        return NGX_OK;
++    }
++    uint16_t len = 0;
++    u_char* p = in->buf->pos;
++    ngx_rtmp_hls_copy(s, &len, &p, 2, &in);
++    u_char data[len];
++    ngx_memzero(&data,len);
++    ngx_rtmp_hls_copy(s, &data, &p, len, &in);
++
++    ngx_buf_t* b = ngx_pcalloc(publishing_stream_session->connection->pool, sizeof(ngx_buf_t));
++    if (b == NULL) {
++        ngx_log_debug0( NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "[Tammd] failed to create ngx_buf_t");
++        return NGX_ERROR;
++    }
++    b->start = ngx_palloc(publishing_stream_session->connection->pool, len);
++    if (b->start == NULL) {
++        ngx_log_debug0( NGX_LOG_DEBUG_RTMP, s->connection->log, 0, "[Tammd] failed to create ngx_buf_t length");
++        return NGX_ERROR;
++    }
++    b->end = b->start + len;
++    b->pos = b->last = b->start;
++    b->last = ngx_cpymem(b->last, &data , len);
++    ctx->id3v2_frame = b;
++    ctx->id3v2tag_running = 1;
++    return NGX_OK;
++}
+ 
+ static ngx_int_t
+ ngx_rtmp_hls_postconfiguration(ngx_conf_t *cf)
+ {
+     ngx_rtmp_core_main_conf_t   *cmcf;
+     ngx_rtmp_handler_pt         *h;
++    ngx_rtmp_amf_handler_t      *ch;
+ 
+     cmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_core_module);
+ 
+@@ -2454,5 +2547,9 @@ ngx_rtmp_hls_postconfiguration(ngx_conf_t *cf)
+     next_stream_eof = ngx_rtmp_stream_eof;
+     ngx_rtmp_stream_eof = ngx_rtmp_hls_stream_eof;
+ 
++    ch = ngx_array_push(&cmcf->amf);
++    ngx_str_set(&ch->name, "onIDTag3v2");
++    ch->handler = ngx_rtmp_hls_id3v2;
++
+     return NGX_OK;
+ }
+diff --git a/nginx-rtmp-module/hls/ngx_rtmp_mpegts.c b/nginx-rtmp-module/hls/ngx_rtmp_mpegts.c
+index ae66f71..ad403e9 100644
+--- a/nginx-rtmp-module/hls/ngx_rtmp_mpegts.c
++++ b/nginx-rtmp-module/hls/ngx_rtmp_mpegts.c
+@@ -70,6 +70,69 @@ static u_char ngx_rtmp_mpegts_header[] = {
+     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
+ };
+ 
++static u_char ngx_rtmp_mpegts_header_with_id3[] = {
++
++    /* TS */
++    0x47, 0x40, 0x00, 0x10, 0x00,
++    /* PSI */
++    0x00, 0xb0, 0x0d, 0x00, 0x01, 0xc1, 0x00, 0x00,
++    /* PAT */
++    0x00, 0x01, 0xf0, 0x01,
++    /* CRC */
++    0x2e, 0x70, 0x19, 0x05,
++    /* stuffing 167 bytes */
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++
++    /* TS */
++    0x47, 0x50, 0x01, 0x10, 0x00,
++    /* PSI */
++    0x02, 0xb0, 0x3c, 0x00, 0x01, 0xc1, 0x00, 0x00,
++    /* PMT */
++    0xe1, 0x00,
++    0xf0, 0x11,
++    0x25, 0x0f, 0xff, 0xff, 0x49, 0x44, 0x33, 0x20, 0xff, 0x49, 0x44, 0x33, 0x20, 0x00, 0x1f, 0x00, 0x01,
++    0x1b, 0xe1, 0x00, 0xf0, 0x00, /* h264 */
++    0x0f, 0xe1, 0x01, 0xf0, 0x00, /* aac */
++    0x15, 0xe1, 0x02, 0xf0, 0x0f, 0x26, 0x0d, 0xff, 0xff, 0x49, 0x44, 0x33, 0x20, 0xff, 0x49, 0x44, 0x33, 0x20, 0x00, 0x0f,
++    /*0x03, 0xe1, 0x01, 0xf0, 0x00,*/ /* mp3 */
++    /* CRC */
++    /*0x2f, 0x44, 0xb9, 0x9b, */ /* crc for aac */
++    0x22, 0xbb, 0x5b, 0x1a,
++    /*0x4e, 0x59, 0x3d, 0x1e,*/ /* crc for mp3 */
++    /* stuffing 157 bytes */
++    /*0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,*/ 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
++};
+ 
+ /* 700 ms PCR delay */
+ #define NGX_RTMP_HLS_DELAY  63000
+@@ -155,8 +218,11 @@ ngx_rtmp_mpegts_write_file(ngx_rtmp_mpegts_file_t *file, u_char *in,
+ 
+ 
+ static ngx_int_t
+-ngx_rtmp_mpegts_write_header(ngx_rtmp_mpegts_file_t *file)
++ngx_rtmp_mpegts_write_header(ngx_rtmp_mpegts_file_t *file, unsigned id3v2tag)
+ {
++    if ( id3v2tag == 1)
++        return ngx_rtmp_mpegts_write_file(file, ngx_rtmp_mpegts_header_with_id3,
++                                      sizeof(ngx_rtmp_mpegts_header_with_id3));
+     return ngx_rtmp_mpegts_write_file(file, ngx_rtmp_mpegts_header,
+                                       sizeof(ngx_rtmp_mpegts_header));
+ }
+@@ -247,6 +313,8 @@ ngx_rtmp_mpegts_write_frame(ngx_rtmp_mpegts_file_t *file,
+ 
+             header_size = 5;
+             flags = 0x80; /* PTS */
++            if ( f->pid == 0x102 ) // Meta Data
++                flags = 0x84;
+ 
+             if (f->dts != f->pts) {
+                 header_size += 5;
+@@ -350,7 +418,7 @@ ngx_rtmp_mpegts_init_encryption(ngx_rtmp_mpegts_file_t *file,
+ 
+ ngx_int_t
+ ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+-    ngx_log_t *log)
++    ngx_log_t *log, unsigned id3v2tag)
+ {
+     file->log = log;
+ 
+@@ -365,7 +433,7 @@ ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+ 
+     file->size = 0;
+ 
+-    if (ngx_rtmp_mpegts_write_header(file) != NGX_OK) {
++    if (ngx_rtmp_mpegts_write_header(file, id3v2tag) != NGX_OK) {
+         ngx_log_error(NGX_LOG_ERR, log, ngx_errno,
+                       "hls: error writing fragment header");
+         ngx_close_file(file->fd);
+diff --git a/nginx-rtmp-module/hls/ngx_rtmp_mpegts.h b/nginx-rtmp-module/hls/ngx_rtmp_mpegts.h
+index c128a51..6cbe877 100644
+--- a/nginx-rtmp-module/hls/ngx_rtmp_mpegts.h
++++ b/nginx-rtmp-module/hls/ngx_rtmp_mpegts.h
+@@ -37,7 +37,7 @@ typedef struct {
+ ngx_int_t ngx_rtmp_mpegts_init_encryption(ngx_rtmp_mpegts_file_t *file,
+     u_char *key, size_t key_len, uint64_t iv);
+ ngx_int_t ngx_rtmp_mpegts_open_file(ngx_rtmp_mpegts_file_t *file, u_char *path,
+-    ngx_log_t *log);
++    ngx_log_t *log, unsigned id3v2tag);
+ ngx_int_t ngx_rtmp_mpegts_close_file(ngx_rtmp_mpegts_file_t *file);
+ ngx_int_t ngx_rtmp_mpegts_write_frame(ngx_rtmp_mpegts_file_t *file,
+     ngx_rtmp_mpegts_frame_t *f, ngx_buf_t *b);
+diff --git a/nginx-rtmp-module/ngx_rtmp_handshake.c b/nginx-rtmp-module/ngx_rtmp_handshake.c
+index d58fcff..8ce2e7a 100644
+--- a/nginx-rtmp-module/ngx_rtmp_handshake.c
++++ b/nginx-rtmp-module/ngx_rtmp_handshake.c
+@@ -104,30 +104,37 @@ static ngx_int_t
+ ngx_rtmp_make_digest(ngx_str_t *key, ngx_buf_t *src,
+         u_char *skip, u_char *dst, ngx_log_t *log)
+ {
+-    static HMAC_CTX         hmac;
+-    static unsigned         hmac_initialized;
++    static HMAC_CTX         *hmac;
+     unsigned int            len;
+ 
+-    if (!hmac_initialized) {
++    if (hmac == NULL) {
++#if OPENSSL_VERSION_NUMBER < 0x10100000L
++        static HMAC_CTX shmac;
++        hmac = &shmac;
+         HMAC_CTX_init(&hmac);
+-        hmac_initialized = 1;
++#else
++        hmac = HMAC_CTX_new();
++        if (hmac == NULL) {
++            return NGX_ERROR;
++        }
++#endif
+     }
+ 
+-    HMAC_Init_ex(&hmac, key->data, key->len, EVP_sha256(), NULL);
++    HMAC_Init_ex(hmac, key->data, key->len, EVP_sha256(), NULL);
+ 
+     if (skip && src->pos <= skip && skip <= src->last) {
+         if (skip != src->pos) {
+-            HMAC_Update(&hmac, src->pos, skip - src->pos);
++            HMAC_Update(hmac, src->pos, skip - src->pos);
+         }
+         if (src->last != skip + NGX_RTMP_HANDSHAKE_KEYLEN) {
+-            HMAC_Update(&hmac, skip + NGX_RTMP_HANDSHAKE_KEYLEN,
++            HMAC_Update(hmac, skip + NGX_RTMP_HANDSHAKE_KEYLEN,
+                     src->last - skip - NGX_RTMP_HANDSHAKE_KEYLEN);
+         }
+     } else {
+-        HMAC_Update(&hmac, src->pos, src->last - src->pos);
++        HMAC_Update(hmac, src->pos, src->last - src->pos);
+     }
+ 
+-    HMAC_Final(&hmac, dst, &len);
++    HMAC_Final(hmac, dst, &len);
+ 
+     return NGX_OK;
+ }
